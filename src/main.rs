@@ -2,21 +2,25 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use clap::{Parser, ValueEnum};
+use eframe::egui;
 use exif::{In, Reader, Tag};
+use rfd::FileDialog;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "按日期自动分类照片/视频到 YYYY-MM-DD 文件夹")]
 struct Args {
     #[arg(short, long, help = "源目录（例如 SD 卡挂载目录）")]
-    source: PathBuf,
+    source: Option<PathBuf>,
 
     #[arg(short, long, help = "目标目录（会自动创建 YYYY-MM-DD 子目录）")]
-    target: PathBuf,
+    target: Option<PathBuf>,
 
     #[arg(
         short,
@@ -43,9 +47,12 @@ struct Args {
         help = "目标目录模板，支持 {YYYY} {MM} {DD}（可包含子目录）"
     )]
     template: String,
+
+    #[arg(long, default_value_t = false, help = "强制启动图形界面")]
+    gui: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum TimeSource {
     Auto,
     Exif,
@@ -53,18 +60,314 @@ enum TimeSource {
     Modified,
 }
 
+impl TimeSource {
+    fn label(self) -> &'static str {
+        match self {
+            TimeSource::Auto => "auto (元数据优先，回退文件时间)",
+            TimeSource::Exif => "exif (仅元数据)",
+            TimeSource::Created => "created (仅创建时间)",
+            TimeSource::Modified => "modified (仅修改时间)",
+        }
+    }
+
+    fn all() -> [TimeSource; 4] {
+        [
+            TimeSource::Auto,
+            TimeSource::Exif,
+            TimeSource::Created,
+            TimeSource::Modified,
+        ]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RunOptions {
+    source: PathBuf,
+    target: PathBuf,
+    mv: bool,
+    dry_run: bool,
+    time_source: TimeSource,
+    template: String,
+}
+
+#[derive(Debug)]
+struct RunSummary {
+    scanned: usize,
+    handled: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+enum WorkerMessage {
+    Log(String),
+    Done(Result<RunSummary, String>),
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if !args.source.exists() {
-        anyhow::bail!("源目录不存在: {}", args.source.display());
+    if args.gui || args.source.is_none() || args.target.is_none() {
+        return launch_gui();
     }
-    if !args.source.is_dir() {
-        anyhow::bail!("源路径不是目录: {}", args.source.display());
+
+    let opts = RunOptions {
+        source: args.source.expect("source checked"),
+        target: args.target.expect("target checked"),
+        mv: args.mv,
+        dry_run: args.dry_run,
+        time_source: args.time_source,
+        template: args.template,
+    };
+
+    let summary = process_files(&opts, |line| println!("{line}"))?;
+    println!(
+        "\n完成: 扫描 {} 个文件，处理 {} 个媒体文件，跳过 {} 个非媒体文件，失败 {} 个文件。",
+        summary.scanned, summary.handled, summary.skipped, summary.failed
+    );
+    Ok(())
+}
+
+fn launch_gui() -> Result<()> {
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "FileCopyer GUI",
+        native_options,
+        Box::new(|cc| {
+            setup_cjk_fonts(&cc.egui_ctx);
+            Ok(Box::new(FileCopyerApp::default()))
+        }),
+    )
+    .map_err(|err| anyhow::anyhow!("GUI 启动失败: {err}"))
+}
+
+fn setup_cjk_fonts(ctx: &egui::Context) {
+    let candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ];
+
+    let Some(font_bytes) = candidates.iter().find_map(|path| fs::read(path).ok()) else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_string(),
+        egui::FontData::from_owned(font_bytes).into(),
+    );
+
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "cjk".to_string());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "cjk".to_string());
+
+    ctx.set_fonts(fonts);
+}
+
+struct FileCopyerApp {
+    source: String,
+    target: String,
+    template: String,
+    time_source: TimeSource,
+    mv: bool,
+    dry_run: bool,
+    running: bool,
+    logs: Vec<String>,
+    summary: Option<String>,
+    rx: Option<Receiver<WorkerMessage>>,
+}
+
+impl Default for FileCopyerApp {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            target: String::new(),
+            template: "{YYYY}-{MM}-{DD}".to_string(),
+            time_source: TimeSource::Auto,
+            mv: false,
+            dry_run: false,
+            running: false,
+            logs: Vec::new(),
+            summary: None,
+            rx: None,
+        }
     }
-    if !args.target.exists() && !args.dry_run {
-        fs::create_dir_all(&args.target)
-            .with_context(|| format!("无法创建目标目录: {}", args.target.display()))?;
+}
+
+impl eframe::App for FileCopyerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_worker();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("FileCopyer - 照片/视频自动归档");
+            ui.label("选择源目录和目标目录，按日期自动分类。");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("源目录:");
+                ui.text_edit_singleline(&mut self.source);
+                if ui.button("选择...").clicked()
+                    && !self.running
+                    && let Some(path) = FileDialog::new().pick_folder()
+                {
+                    self.source = path.display().to_string();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("目标目录:");
+                ui.text_edit_singleline(&mut self.target);
+                if ui.button("选择...").clicked()
+                    && !self.running
+                    && let Some(path) = FileDialog::new().pick_folder()
+                {
+                    self.target = path.display().to_string();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("目录模板:");
+                ui.text_edit_singleline(&mut self.template);
+            });
+            ui.small("可用变量: {YYYY} {MM} {DD}，例如 {YYYY}/{MM}/{DD}");
+
+            ui.horizontal(|ui| {
+                ui.label("时间来源:");
+                egui::ComboBox::from_id_salt("time_source")
+                    .selected_text(self.time_source.label())
+                    .show_ui(ui, |ui| {
+                        for source in TimeSource::all() {
+                            ui.selectable_value(&mut self.time_source, source, source.label());
+                        }
+                    });
+            });
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.mv, "移动文件（默认复制）");
+                ui.checkbox(&mut self.dry_run, "仅预演（dry-run）");
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let start_enabled = !self.running;
+                if ui
+                    .add_enabled(start_enabled, egui::Button::new("开始整理"))
+                    .clicked()
+                {
+                    self.start_task();
+                }
+
+                if self.running {
+                    ui.label("处理中...");
+                }
+            });
+
+            if let Some(summary) = &self.summary {
+                ui.separator();
+                ui.label(summary);
+            }
+
+            ui.separator();
+            ui.label("执行日志:");
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &self.logs {
+                        ui.label(line);
+                    }
+                });
+        });
+    }
+}
+
+impl FileCopyerApp {
+    fn start_task(&mut self) {
+        self.summary = None;
+
+        let source = self.source.trim();
+        let target = self.target.trim();
+        if source.is_empty() || target.is_empty() {
+            self.logs
+                .push("[error] 源目录和目标目录都不能为空".to_string());
+            return;
+        }
+
+        let options = RunOptions {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            mv: self.mv,
+            dry_run: self.dry_run,
+            time_source: self.time_source,
+            template: self.template.clone(),
+        };
+
+        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        self.rx = Some(rx);
+        self.running = true;
+        self.logs.clear();
+
+        thread::spawn(move || {
+            let result = process_files(&options, |line| {
+                let _ = tx.send(WorkerMessage::Log(line));
+            })
+            .map_err(|err| err.to_string());
+
+            let _ = tx.send(WorkerMessage::Done(result));
+        });
+    }
+
+    fn poll_worker(&mut self) {
+        let Some(rx) = &self.rx else {
+            return;
+        };
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                WorkerMessage::Log(line) => self.logs.push(line),
+                WorkerMessage::Done(result) => {
+                    self.running = false;
+                    match result {
+                        Ok(summary) => {
+                            self.summary = Some(format!(
+                                "完成: 扫描 {}，处理 {}，跳过 {}，失败 {}。",
+                                summary.scanned, summary.handled, summary.skipped, summary.failed
+                            ));
+                        }
+                        Err(err) => {
+                            self.summary = Some(format!("执行失败: {err}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn process_files<F>(opts: &RunOptions, mut log: F) -> Result<RunSummary>
+where
+    F: FnMut(String),
+{
+    if !opts.source.exists() {
+        anyhow::bail!("源目录不存在: {}", opts.source.display());
+    }
+    if !opts.source.is_dir() {
+        anyhow::bail!("源路径不是目录: {}", opts.source.display());
+    }
+    if !opts.target.exists() && !opts.dry_run {
+        fs::create_dir_all(&opts.target)
+            .with_context(|| format!("无法创建目标目录: {}", opts.target.display()))?;
     }
 
     let mut scanned = 0usize;
@@ -72,7 +375,7 @@ fn main() -> Result<()> {
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
-    for entry in WalkDir::new(&args.source)
+    for entry in WalkDir::new(&opts.source)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -85,33 +388,54 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let Some(date) = detect_date_by_source(src, args.time_source) else {
-            eprintln!("[skip] 无法确定日期: {}", src.display());
+        let Some(date) = detect_date_by_source(src, opts.time_source) else {
             failed += 1;
+            log(format!("[skip] 无法确定日期: {}", src.display()));
             continue;
         };
 
-        let day_dir = match render_date_template(&args.target, &args.template, date) {
+        let day_dir = match render_date_template(&opts.target, &opts.template, date) {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("[skip] 目录模板生成失败: {} ({})", src.display(), err);
                 failed += 1;
+                log(format!(
+                    "[skip] 目录模板生成失败: {} ({})",
+                    src.display(),
+                    err
+                ));
                 continue;
             }
         };
-        let dst = build_unique_destination(&day_dir, src)?;
 
-        if args.dry_run {
-            println!("[dry-run] {} -> {}", src.display(), dst.display());
+        let dst = match build_unique_destination(&day_dir, src) {
+            Ok(v) => v,
+            Err(err) => {
+                failed += 1;
+                log(format!(
+                    "[skip] 目标路径构建失败: {} ({})",
+                    src.display(),
+                    err
+                ));
+                continue;
+            }
+        };
+
+        if opts.dry_run {
+            log(format!("[dry-run] {} -> {}", src.display(), dst.display()));
             handled += 1;
             continue;
         }
 
-        fs::create_dir_all(&day_dir)
-            .with_context(|| format!("无法创建日期目录: {}", day_dir.display()))?;
+        if let Err(err) = fs::create_dir_all(&day_dir)
+            .with_context(|| format!("无法创建日期目录: {}", day_dir.display()))
+        {
+            failed += 1;
+            log(format!("[skip] {}", err));
+            continue;
+        }
 
-        if args.mv {
-            fs::rename(src, &dst).or_else(|_| {
+        if opts.mv {
+            let move_result = fs::rename(src, &dst).or_else(|_| {
                 fs::copy(src, &dst)
                     .with_context(|| {
                         format!(
@@ -124,21 +448,40 @@ fn main() -> Result<()> {
                         fs::remove_file(src)
                             .with_context(|| format!("删除源文件失败: {}", src.display()))
                     })
-            })?;
-            println!("[move] {} -> {}", src.display(), dst.display());
+            });
+
+            match move_result {
+                Ok(_) => {
+                    handled += 1;
+                    log(format!("[move] {} -> {}", src.display(), dst.display()));
+                }
+                Err(err) => {
+                    failed += 1;
+                    log(format!("[skip] {}", err));
+                }
+            }
         } else {
-            fs::copy(src, &dst)
-                .with_context(|| format!("复制失败: {} -> {}", src.display(), dst.display()))?;
-            println!("[copy] {} -> {}", src.display(), dst.display());
+            match fs::copy(src, &dst)
+                .with_context(|| format!("复制失败: {} -> {}", src.display(), dst.display()))
+            {
+                Ok(_) => {
+                    handled += 1;
+                    log(format!("[copy] {} -> {}", src.display(), dst.display()));
+                }
+                Err(err) => {
+                    failed += 1;
+                    log(format!("[skip] {}", err));
+                }
+            }
         }
-        handled += 1;
     }
 
-    println!(
-        "\n完成: 扫描 {} 个文件，处理 {} 个媒体文件，跳过 {} 个非媒体文件，失败 {} 个文件。",
-        scanned, handled, skipped, failed
-    );
-    Ok(())
+    Ok(RunSummary {
+        scanned,
+        handled,
+        skipped,
+        failed,
+    })
 }
 
 fn detect_date_by_source(path: &Path, source: TimeSource) -> Option<NaiveDateTime> {
@@ -298,12 +641,12 @@ fn find_qt_creation_time(
                 return Some(dt);
             }
         } else if is_qt_container(kind) {
-            if let Some(dt) = if kind == *b"meta" && payload_end.saturating_sub(payload_start) >= 4
-            {
+            let nested = if kind == *b"meta" && payload_end.saturating_sub(payload_start) >= 4 {
                 find_qt_creation_time(file, payload_start + 4, payload_end, depth + 1)
             } else {
                 find_qt_creation_time(file, payload_start, payload_end, depth + 1)
-            } {
+            };
+            if let Some(dt) = nested {
                 return Some(dt);
             }
         }
